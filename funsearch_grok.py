@@ -13,7 +13,6 @@ POPULATION_SIZE = 3
 MAX_RETRIES = 5
 BASE_DELAY = 1.5
 
-
 def load_taillard_instance(file_path: str) -> Dict:
     """
     解析流水车间(Flow Shop)格式的Taillard数据。
@@ -43,7 +42,6 @@ def load_taillard_instance(file_path: str) -> Dict:
     except Exception as e:
         print(f"数据加载失败: {e}")
         return None
-
 
 def calculate_makespan(schedule: List[Tuple[int, int]], instance: Dict) -> int:
     """
@@ -88,7 +86,6 @@ def calculate_makespan(schedule: List[Tuple[int, int]], instance: Dict) -> int:
         return float('inf')
     return max(machine_times)
 
-
 def evaluate_program(program_code: str, instance: Dict) -> Tuple[int, str]:
     """
     对生成的代码进行评估，自动删除所有 Markdown 格式标记（```等），
@@ -110,10 +107,12 @@ def scheduler(instance):
     {inner_code}
     return schedule
 """
-        # 设置执行环境，添加 __name__ 防止 if __name__ == '__main__' 报错
+        # 设置执行环境，允许 min 和 max
         restricted_globals = {
-            "__builtins__": {"range": range, "int": int, "list": list, "len": len, "min": min, "max": max,
-                             "sorted": sorted, "float": float},
+            "__builtins__": {
+                "range": range, "int": int, "list": list, "len": len,
+                "min": min, "max": max
+            },
             "instance": instance,
             "__name__": "__main__"
         }
@@ -142,11 +141,14 @@ def scheduler(instance):
         try:
             schedule = func_timeout(5, safe_exec)
         except FunctionTimedOut:
-            print("代码执行超时")
-            return float('inf'), "代码执行超时"
+            return float('inf'), "代码执行超时（超过5秒）"
         except Exception as e:
-            print(f"执行错误: {e}")
-            return float('inf'), str(e)
+            error_message = f"执行错误: {str(e)}"
+            if "is not defined" in str(e):
+                error_message += " - 请检查是否使用了未允许的函数，仅限 range, len, list, int, min, max"
+            elif "index out of range" in str(e):
+                error_message += " - 请检查对 instance['processing_times'] 的访问是否越界"
+            return float('inf'), error_message
 
         makespan = calculate_makespan(schedule, instance)
         return makespan, None
@@ -156,7 +158,6 @@ def scheduler(instance):
         print(error_message)
         return float('inf'), error_message
 
-
 class DashScopeLLM:
     def __init__(self):
         self.client = OpenAI(
@@ -164,7 +165,8 @@ class DashScopeLLM:
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
         self.model = "qwen-coder-plus-latest"
-        self.temperature = 0.7
+        self.temperature = 0.5  # 调整为0.5
+        self.max_tokens = 1500  # 增加到1500
 
     def generate(self, prompt: str) -> str:
         """
@@ -177,11 +179,11 @@ class DashScopeLLM:
                     model=self.model,
                     messages=[
                         {"role": "system",
-                         "content": "你是一个专注于调度算法优化的AI助手。请基于给定代码和错误反馈做微调，只修改必要部分，使得调度方案中每个作业的工序严格按顺序执行。优先使用最早完工时间优先（EFT）、最短加工时间优先（SPT）等高效调度策略。确保代码逻辑正确，避免出现函数未定义、属性错误等问题。"},
+                         "content": "你是一个专注于调度算法优化的AI助手。请基于给定代码和错误反馈做微调，只修改必要部分，使得调度方案中每个作业的工序严格按顺序执行。"},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=self.temperature,
-                    max_tokens=1000,
+                    max_tokens=self.max_tokens,
                     timeout=30
                 )
                 latency = time.time() - start_time
@@ -197,7 +199,6 @@ class DashScopeLLM:
                 time.sleep(delay)
         print(f"连续{MAX_RETRIES}次请求失败")
         return None
-
 
 class FunSearch:
     def __init__(self, instance: Dict):
@@ -249,19 +250,34 @@ def scheduler(instance):
                 continue
 
     def _build_prompt(self) -> str:
-        error_str = ""
-        if self.error_history:
-            error_str = "\n\n# 之前出现的错误信息\n" + "\n".join(self.error_history)
+        error_str = "\n".join(self.error_history) if self.error_history else "无"
         current_best = min(score for _, score in self.programs_db)
-        return f"""请基于以下代码和错误反馈对调度算法做微调：
+        return f"""你是一个专注于流水车间（Flow Shop）调度优化的AI助手。请基于以下信息对调度算法进行微调，目标是最小化makespan。
+
+# 调度问题描述：
+- 作业数量：{self.instance['num_jobs']} 个
+- 机器数量：{self.instance['num_machines']} 台
+- 每个作业有 {self.instance['num_machines']} 个工序，必须严格按照 0, 1, 2, ..., {self.instance['num_machines']-1} 的顺序在对应机器上执行。
+- 加工时间存储在 instance['processing_times'] 中，其中 instance['processing_times'][j][m] 表示作业 j 在机器 m 上的工序加工时间。
+- 调度方案是一个列表，元素为元组 (job, operation)，表示作业 job 的第 operation 个工序。
+
 # 当前代码：
 {self.programs_db[0][0]}
 
-# 当前评估结果: makespan = {current_best}
+# 当前评估结果：
+makespan = {current_best}
+
 # 近期错误反馈：
 {error_str}
 
-请在保证每个作业的工序严格按照 0, 1, 2, ... 顺序执行的基础上，优化调度方案以降低 makespan。优先使用最早完工时间优先（EFT）、最短加工时间优先（SPT）等高效调度策略。确保代码逻辑正确，避免出现函数未定义、属性错误等问题。你可以大幅度修改代码，但是必须以def scheduler(instance):开头，以return schedule结尾，仅输出修改后的函数定义，不要包含额外代码。注意：使用正确的命名空间，确保sorted、float等内置函数可用，并且返回的调度结果必须是(job, op)二元组列表。
+# 要求：
+1. 优化调度方案以降低makespan，考虑使用启发式方法（如NEH算法、Johnson's rule的扩展）或贪心策略。
+2. 严格保证每个作业的工序按 0, 1, 2, ... 顺序执行。
+3. 仅使用以下内置函数：range, len, list, int, min, max，避免使用其他未提供的函数。
+4. 使用 instance['processing_times'] 获取加工时间，不要假设固定时间。
+5. 函数必须以 def scheduler(instance): 开头，以 return schedule 结尾，仅输出函数定义，无额外代码或注释。
+
+请生成优化后的调度代码。
 """
 
     def _update_population(self, new_code: str, score: float):
@@ -272,7 +288,6 @@ def scheduler(instance):
         self.programs_db.append((new_code, score))
         self.programs_db.sort(key=lambda x: x[1])
         self.programs_db = self.programs_db[:POPULATION_SIZE]
-
 
 def main():
     print("当前API密钥:", os.getenv("DASHSCOPE_API_KEY"))
@@ -290,9 +305,5 @@ def main():
     print("最佳程序代码:")
     print(best_program)
 
-
 if __name__ == "__main__":
     main()
-
-
-

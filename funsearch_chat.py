@@ -112,8 +112,7 @@ def scheduler(instance):
 """
         # 设置执行环境，添加 __name__ 防止 if __name__ == '__main__' 报错
         restricted_globals = {
-            "__builtins__": {"range": range, "int": int, "list": list, "len": len, "min": min, "max": max,
-                             "sorted": sorted, "float": float},
+            "__builtins__": {"range": range, "int": int, "list": list, "len": len},
             "instance": instance,
             "__name__": "__main__"
         }
@@ -177,7 +176,7 @@ class DashScopeLLM:
                     model=self.model,
                     messages=[
                         {"role": "system",
-                         "content": "你是一个专注于调度算法优化的AI助手。请基于给定代码和错误反馈做微调，只修改必要部分，使得调度方案中每个作业的工序严格按顺序执行。优先使用最早完工时间优先（EFT）、最短加工时间优先（SPT）等高效调度策略。确保代码逻辑正确，避免出现函数未定义、属性错误等问题。"},
+                         "content": "你是一个专注于调度算法优化的AI助手。请基于给定代码和错误反馈做微调，只修改必要部分，使得调度方案中每个作业的工序严格按顺序执行。"},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=self.temperature,
@@ -261,7 +260,7 @@ def scheduler(instance):
 # 近期错误反馈：
 {error_str}
 
-请在保证每个作业的工序严格按照 0, 1, 2, ... 顺序执行的基础上，优化调度方案以降低 makespan。优先使用最早完工时间优先（EFT）、最短加工时间优先（SPT）等高效调度策略。确保代码逻辑正确，避免出现函数未定义、属性错误等问题。你可以大幅度修改代码，但是必须以def scheduler(instance):开头，以return schedule结尾，仅输出修改后的函数定义，不要包含额外代码。注意：使用正确的命名空间，确保sorted、float等内置函数可用，并且返回的调度结果必须是(job, op)二元组列表。
+请在保证每个作业的工序严格按照 0, 1, 2, ... 顺序执行的基础上，优化调度方案以降低 makespan。你可以大幅度修改代码，但是必须以def scheduler(instance):开头，以return schedule结尾，仅输出修改后的函数定义，不要包含额外代码。
 """
 
     def _update_population(self, new_code: str, score: float):
@@ -293,6 +292,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 

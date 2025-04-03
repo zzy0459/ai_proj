@@ -163,5 +163,5 @@ def solve_with_ga(instance_name):
 # -------------------------------
 if __name__ == "__main__":
     # 测试Taillard实例
-    instance = "ta081"
+    instance = "ta092"
     solve_with_ga(instance)
