@@ -1,8 +1,8 @@
 import os
-import random
 import time
 import re
-from typing import List, Tuple, Dict
+import textwrap
+from typing import List, Tuple, Dict, Any
 from openai import OpenAI
 from func_timeout import func_timeout, FunctionTimedOut
 
@@ -12,6 +12,8 @@ MAX_ITERATIONS = 10
 POPULATION_SIZE = 3
 MAX_RETRIES = 5
 BASE_DELAY = 1.5
+# 强制输出格式的正则
+SCHEDULER_REGEX = r'^def scheduler\(instance\):[\s\S]*?return schedule$'
 
 
 def load_taillard_instance(file_path: str) -> Dict:
@@ -45,11 +47,10 @@ def load_taillard_instance(file_path: str) -> Dict:
         return None
 
 
-def calculate_makespan(schedule: List[Tuple[int, int]], instance: Dict) -> int:
+def calculate_makespan(schedule: List[Any], instance: Dict) -> int:
     """
     计算调度方案的 makespan。
-    使用 job_finish 记录作业完成时间，machine_times 记录机器完成时间，
-    检查每个作业的工序是否严格按照顺序执行。
+    验证每个作业的工序严格按顺序执行，并返回总完工时间。
     """
     num_jobs = instance['num_jobs']
     num_machines = instance['num_machines']
@@ -60,23 +61,19 @@ def calculate_makespan(schedule: List[Tuple[int, int]], instance: Dict) -> int:
     job_finish = [0] * num_jobs
     next_op = [0] * num_jobs
 
-    for step in schedule:
-        if not (isinstance(step, tuple) and len(step) == 2):
-            print(f"无效调度步骤: {step}")
+    for idx, step in enumerate(schedule):
+        if not (hasattr(step, '__getitem__') and len(step) >= 2):
+            print(f"索引 {idx} 处的调度步骤格式错误: {step}")
             return float('inf')
-        job, op = step
+        job, op = step[0], step[1]
         if not (0 <= job < num_jobs) or not (0 <= op < num_machines):
-            print(f"非法作业ID或工序号: {step}")
+            print(f"步骤 {idx} 非法作业ID或工序号: {step}")
             return float('inf')
         if op != next_op[job]:
-            print(f"工序顺序错误: 作业 {job} 预期 {next_op[job]}，实际 {op}")
+            print(f"步骤 {idx} 工序顺序错误: 作业 {job} 预期 {next_op[job]}，实际 {op}")
             return float('inf')
-        try:
-            machine = machine_orders[job][op]
-            proc_time = processing_times[job][op]
-        except IndexError as e:
-            print(f"数据访问错误: {e}")
-            return float('inf')
+        machine = machine_orders[job][op]
+        proc_time = processing_times[job][op]
         start_time = max(job_finish[job], machine_times[machine])
         finish_time = start_time + proc_time
         machine_times[machine] = finish_time
@@ -91,69 +88,68 @@ def calculate_makespan(schedule: List[Tuple[int, int]], instance: Dict) -> int:
 
 def evaluate_program(program_code: str, instance: Dict) -> Tuple[int, str]:
     """
-    对生成的代码进行评估，自动删除所有 Markdown 格式标记（```等），
-    并执行代码检查调度方案是否满足工序顺序要求。
+    清理代码、执行并验证调度方案，返回 makespan 或错误信息。
     """
+    # 去除代码块标记行，保留内容
+    lines = program_code.splitlines()
+    clean_lines = [l for l in lines if not l.strip().startswith('```')]
+    clean_code = '\n'.join(clean_lines)
+
+    # 提取完整函数定义
+    func_match = re.search(r'(def scheduler\s*\([^)]*\):[\s\S]*?\breturn\s+schedule)', clean_code)
+    if not func_match:
+        return float('inf'), "未找到完整的 scheduler 定义或 return schedule"
+    func_def = func_match.group(1)
+
+    # 确保正确缩进
+    body_match = re.search(r'def scheduler\s*\([^)]*\):(.*)', func_def, re.S)
+    if not body_match:
+        return float('inf'), "无法解析函数体结构"
+    body = textwrap.dedent(body_match.group(1))
+    indented = ''.join('    ' + line + '\n' for line in body.splitlines())
+    new_code = f"def scheduler(data):\n{indented}    return schedule\n"
+
+    restricted_globals = {
+        '__builtins__': {'range': range, 'len': len, 'int': int, 'list': list},
+        'instance': instance['processing_times'],
+        '__name__': '__main__'
+    }
     try:
-        start_idx = program_code.find("def scheduler(instance):")
-        if start_idx == -1:
-            return float('inf'), "未找到 scheduler 函数定义"
-        start_idx += len("def scheduler(instance):")
-
-        end_idx = program_code.find("return schedule", start_idx)
-        if end_idx == -1:
-            return float('inf'), "未找到 return schedule 语句"
-
-        inner_code = program_code[start_idx:end_idx].strip()
-        new_program_code = f"""
-def scheduler(instance):
-    {inner_code}
-    return schedule
-"""
-        # 设置执行环境，添加 __name__ 防止 if __name__ == '__main__' 报错
-        restricted_globals = {
-            "__builtins__": {"range": range, "int": int, "list": list, "len": len},
-            "instance": instance,
-            "__name__": "__main__"
-        }
-        exec(new_program_code, restricted_globals)
-        if 'scheduler' not in restricted_globals:
-            print("未找到 scheduler 函数")
-            return float('inf'), "未找到 scheduler 函数"
-
-        def safe_exec():
-            scheduler = restricted_globals['scheduler']
-            schedule = scheduler(instance)
-            if not isinstance(schedule, list):
-                raise TypeError("调度结果必须为列表类型")
-            op_progress = [0] * instance['num_jobs']
-            for step in schedule:
-                if not (isinstance(step, tuple) and len(step) == 2):
-                    raise ValueError(f"无效步骤格式: {step}")
-                job, op = step
-                if op != op_progress[job]:
-                    raise ValueError(f"工序顺序错误: 作业 {job} 预期 {op_progress[job]}，实际 {op}")
-                op_progress[job] += 1
-            if any(op_progress[j] != instance['num_machines'] for j in range(instance['num_jobs'])):
-                raise ValueError("部分作业未完成所有工序")
-            return schedule
-
-        try:
-            schedule = func_timeout(5, safe_exec)
-        except FunctionTimedOut:
-            print("代码执行超时")
-            return float('inf'), "代码执行超时"
-        except Exception as e:
-            print(f"执行错误: {e}")
-            return float('inf'), str(e)
-
-        makespan = calculate_makespan(schedule, instance)
-        return makespan, None
-
+        exec(new_code, restricted_globals)
     except Exception as e:
-        error_message = f"评估异常: {e}"
-        print(error_message)
-        return float('inf'), error_message
+        return float('inf'), f"编译错误: {e}"
+
+    def safe_exec():
+        scheduler = restricted_globals['scheduler']
+        schedule = scheduler(restricted_globals['instance'])
+        if not isinstance(schedule, list):
+            raise TypeError("调度结果必须为列表类型")
+        return schedule
+
+    try:
+        schedule = func_timeout(5, safe_exec)
+    except FunctionTimedOut:
+        return float('inf'), '代码执行超时'
+    except Exception as e:
+        return float('inf'), f"执行错误: {e}"
+
+    # 验证与计算 makespan
+    import io, contextlib
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            makespan = calculate_makespan(schedule, instance)
+    except Exception as e:
+        debug = buf.getvalue().strip()
+        reason = f"验证时异常: {e}"
+        if debug:
+            reason += f" | 输出: {debug}"
+        return float('inf'), reason
+    debug_output = buf.getvalue().strip()
+    if makespan == float('inf'):
+        reason = debug_output or '未知验证错误'
+        return makespan, reason
+    return makespan, None
 
 
 class DashScopeLLM:
@@ -162,39 +158,36 @@ class DashScopeLLM:
             api_key=os.getenv("DASHSCOPE_API_KEY"),
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
-        self.model = "qwen-coder-plus-latest"
+        self.model = "qwen-max-latest"
         self.temperature = 0.7
 
     def generate(self, prompt: str) -> str:
-        """
-        调用大模型生成代码，支持指数退避重试机制
-        """
+        # 在提示中加入正则要求
+        prompt += f"\n\n# 请仅输出满足以下正则的函数定义，不要包含注释或额外的代码： {SCHEDULER_REGEX}"
         for attempt in range(MAX_RETRIES):
             try:
-                start_time = time.time()
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system",
-                         "content": "你是一个专注于调度算法优化的AI助手。请基于给定代码和错误反馈做微调，只修改必要部分，使得调度方案中每个作业的工序严格按顺序执行。"},
+                        {"role": "system", "content": (
+                            "你是调度算法优化助手，基于给定错误反馈和代码，改进 scheduler 函数。"
+                        )},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=self.temperature,
                     max_tokens=1000,
                     timeout=30
                 )
-                latency = time.time() - start_time
-                print(f"API响应时间: {latency:.2f}秒")
-                if (not response.choices or not response.choices[0].message or not response.choices[0].message.content):
-                    raise ValueError("无效的API响应格式")
-                print("API回复内容：")
-                print(response.choices[0].message.content)
-                return response.choices[0].message.content
+                code = response.choices[0].message.content.strip()
+                # 验证正则
+                if not re.match(SCHEDULER_REGEX, code, re.MULTILINE):
+                    print("生成代码未匹配正则格式，跳过此输出")
+                    return None
+                return code
             except Exception as e:
                 delay = BASE_DELAY ** attempt
-                print(f"API请求失败（第{attempt + 1}次重试）: {e} | {delay:.1f}秒后重试")
+                print(f"API请求失败: {e}，{delay:.1f}s后重试")
                 time.sleep(delay)
-        print(f"连续{MAX_RETRIES}次请求失败")
         return None
 
 
@@ -202,21 +195,20 @@ class FunSearch:
     def __init__(self, instance: Dict):
         self.instance = instance
         self.llm = DashScopeLLM()
-        self.programs_db = []
-        self.error_history = []
-        # 初始代码作为起点
+        self.programs_db: List[Tuple[str, float]] = []
+        self.error_history: List[str] = []
         initial_program = self._create_initial_program()
-        initial_score, error_message = evaluate_program(initial_program, instance)
-        if error_message:
-            self.error_history.append(error_message)
-        self.programs_db.append((initial_program, initial_score))
+        score, err = evaluate_program(initial_program, instance)
+        if err:
+            print(f"初始程序评估错误: {err}")
+            self.error_history.append(err)
+        self.programs_db.append((initial_program, score))
 
     def _create_initial_program(self) -> str:
         return f"""
 def scheduler(instance):
     num_jobs = {self.instance['num_jobs']}
     num_machines = {self.instance['num_machines']}
-    # 初始调度：每个作业的工序按顺序加工
     schedule = []
     for j in range(num_jobs):
         for op in range(num_machines):
@@ -224,35 +216,16 @@ def scheduler(instance):
     return schedule
 """
 
-    def evolve(self):
-        for iter in range(MAX_ITERATIONS):
-            print(f"\n=== 迭代 {iter + 1}/{MAX_ITERATIONS} ===")
-            best_score = min(score for _, score in self.programs_db)
-            print(f"当前最佳分数: {best_score if best_score != float('inf') else '无解'}")
-            try:
-                prompt = self._build_prompt()
-                print("提示长度:", len(prompt), "字符")
-                new_code = self.llm.generate(prompt)
-                if not new_code:
-                    continue
-                if "def scheduler" not in new_code:
-                    print("生成代码缺少函数定义")
-                    continue
-                score, error_message = evaluate_program(new_code, self.instance)
-                if error_message:
-                    self.error_history.append(error_message)
-                print(f"评估结果: {score if score != float('inf') else '无效解'}")
-                self._update_population(new_code, score)
-            except Exception as e:
-                print(f"迭代异常: {e}")
-                continue
-
     def _build_prompt(self) -> str:
         error_str = ""
         if self.error_history:
             error_str = "\n\n# 之前出现的错误信息\n" + "\n".join(self.error_history)
         current_best = min(score for _, score in self.programs_db)
+        instance_note = (
+            "# 注意: 传入 instance 为二维列表，instance[j][op] 返回加工时间。"
+        )
         return f"""请基于以下代码和错误反馈对调度算法做微调：
+{instance_note}
 # 当前代码：
 {self.programs_db[0][0]}
 
@@ -260,35 +233,50 @@ def scheduler(instance):
 # 近期错误反馈：
 {error_str}
 
-请在保证每个作业的工序严格按照 0, 1, 2, ... 顺序执行的基础上，优化调度方案以降低 makespan。你可以大幅度修改代码，但是必须以def scheduler(instance):开头，以return schedule结尾，仅输出修改后的函数定义，不要包含额外代码。
-"""
+请优化 scheduler 函数以降低 makespan，仅输出完整函数定义，不要包含额外说明。"""
 
-    def _update_population(self, new_code: str, score: float):
-        existing_codes = [code for code, _ in self.programs_db]
-        if new_code in existing_codes:
-            print("发现重复程序，跳过")
+    def _update_population(self, code: str, score: float):
+        if code in (c for c, _ in self.programs_db):
+            print("重复程序，跳过")
             return
-        self.programs_db.append((new_code, score))
+        self.programs_db.append((code, score))
         self.programs_db.sort(key=lambda x: x[1])
         self.programs_db = self.programs_db[:POPULATION_SIZE]
 
+    def evolve(self):
+        for i in range(MAX_ITERATIONS):
+            print(f"=== 迭代 {i+1}/{MAX_ITERATIONS} ===")
+            best = min(s for _, s in self.programs_db)
+            print(f"当前最佳 makespan: {best}")
+            prompt = self._build_prompt()
+            new_code = self.llm.generate(prompt)
+            if not new_code or 'def scheduler' not in new_code:
+                print("无效的生成内容，跳过")
+                continue
+            score, err = evaluate_program(new_code, self.instance)
+            if err:
+                print(f"执行错误: {err}")
+                self.error_history.append(err)
+            else:
+                print(f"评估结果: {score}")
+            self._update_population(new_code, score)
+
 
 def main():
-    print("当前API密钥:", os.getenv("DASHSCOPE_API_KEY"))
-    if not os.getenv("DASHSCOPE_API_KEY"):
-        print("请先设置 DASHSCOPE_API_KEY 环境变量")
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        print("请设置环境变量 DASHSCOPE_API_KEY")
         return
-    instance_path = os.path.join(TAILLARD_DIR, 'ta092.dat')
-    instance = load_taillard_instance(instance_path)
-    if not instance:
+    path = os.path.join(TAILLARD_DIR, 'ta092.dat')
+    inst = load_taillard_instance(path)
+    if not inst:
         return
-    funsearch = FunSearch(instance)
-    funsearch.evolve()
-    best_program, best_score = min(funsearch.programs_db, key=lambda x: x[1])
+    fs = FunSearch(inst)
+    fs.evolve()
+    best_code, best_score = min(fs.programs_db, key=lambda x: x[1])
     print(f"\n最佳 makespan: {best_score}")
     print("最佳程序代码:")
-    print(best_program)
-
+    print(best_code)
 
 if __name__ == "__main__":
     main()
